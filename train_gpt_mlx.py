@@ -26,6 +26,11 @@ import mlx.nn as nn
 import mlx.optimizers as optim
 from mlx.utils import tree_flatten, tree_unflatten
 
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
 # ==============================================================================
 # SHARD FORMAT + COMPUTE DTYPE
 # ==============================================================================
@@ -46,6 +51,9 @@ class Hyperparameters:
     tokenizer_path: str = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model")
     run_id: str = os.environ.get("RUN_ID", str(uuid.uuid4()))
     seed: int = int(os.environ.get("SEED", 1337))
+    wandb_enabled: bool = bool(int(os.environ.get("WANDB_ENABLED", "1")))
+    wandb_project: str = os.environ.get("WANDB_PROJECT", "parameter-golf-mlx")
+    wandb_entity: str | None = os.environ.get("WANDB_ENTITY")
 
     # Training loop. These defaults now mirror train_gpt.py on a single process.
     iterations: int = int(os.environ.get("ITERATIONS", 20_000))
@@ -471,10 +479,7 @@ class GPT(nn.Module):
             for i in range(num_layers)
         ]
         self.final_norm = RMSNormNoWeight()
-        tok_emb_init = mx.random.normal(self.tok_emb.weight.shape, dtype=mx.float32)
-        self.tok_emb.weight = (
-            zeropower_newtonschulz5(tok_emb_init, steps=10) * tied_embed_init_std
-        ).astype(COMPUTE_DTYPE)
+        self.tok_emb.weight = mx.random.normal(self.tok_emb.weight.shape, dtype=mx.float32) * tied_embed_init_std
 
     def softcap(self, logits: mx.array) -> mx.array:
         c = self.logit_softcap
@@ -898,6 +903,27 @@ def clip_grad_tree(grads_tree: dict, max_norm: float) -> dict:
     return tree_unflatten([(k, g * scale) for k, g in flat.items()])
 
 
+def wandb_config(args: Hyperparameters) -> dict[str, object]:
+    return {
+        "run_id": args.run_id,
+        "seed": args.seed,
+        "vocab_size": args.vocab_size,
+        "num_layers": args.num_layers,
+        "model_dim": args.model_dim,
+        "num_heads": args.num_heads,
+        "num_kv_heads": args.num_kv_heads,
+        "mlp_mult": args.mlp_mult,
+        "lora_rank": args.lora_rank,
+        "lora_alpha": args.lora_alpha,
+        "lora_fixed_seed": args.lora_fixed_seed,
+        "train_batch_tokens": args.train_batch_tokens,
+        "grad_accum_steps": args.grad_accum_steps,
+        "train_seq_len": args.train_seq_len,
+        "iterations": args.iterations,
+        "val_loss_every": args.val_loss_every,
+    }
+
+
 def main() -> None:
     # ==============================================================================
     # TOKENIZER + VALIDATION METRIC SETUP
@@ -913,6 +939,24 @@ def main() -> None:
             print(msg)
         with logfile.open("a", encoding="utf-8") as f:
             print(msg, file=f)
+
+    wandb_run = None
+    if args.wandb_enabled:
+        if wandb is None:
+            log("wandb:disabled import_failed", console=True)
+        else:
+            try:
+                wandb_run = wandb.init(
+                    project=args.wandb_project,
+                    entity=args.wandb_entity,
+                    name=args.run_id,
+                    config=wandb_config(args),
+                )
+                log(f"wandb:enabled project:{args.wandb_project} run:{args.run_id}")
+            except Exception as exc:
+                log(f"wandb:disabled init_failed:{exc}")
+    else:
+        log("wandb:disabled by_config")
 
     code = Path(__file__).read_text(encoding="utf-8")
     log(code, console=False)
@@ -1097,6 +1141,8 @@ def main() -> None:
                     f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                     f"train_time:{train_time_ms:.0f}ms step_avg:{train_time_ms / max(step, 1):.2f}ms"
                 )
+            if wandb_run is not None:
+                wandb_run.log({"val_loss": val_loss}, step=step)
             t0 = time.perf_counter()
         if last_step:
             if stop_after_step is not None and step < args.iterations:
@@ -1126,11 +1172,15 @@ def main() -> None:
         approx_train_time_ms = train_time_ms + 1000.0 * (time.perf_counter() - t0)
         tok_s = args.train_batch_tokens / (step_ms / 1000.0)
         step += 1
+        if wandb_run is not None:
+            wandb_run.log({"train_loss": train_loss_value}, step=step)
         if args.train_log_every > 0 and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None):
             log(
                 f"step:{step}/{args.iterations} train_loss:{train_loss_value:.4f} "
                 f"train_time:{approx_train_time_ms:.0f}ms step_avg:{approx_train_time_ms / step:.2f}ms tok_s:{tok_s:.0f}"
             )
+            if step == 10:
+                log("going silent for a bit... I'm still working!")
         if max_wallclock_ms is not None and stop_after_step is None and approx_train_time_ms >= max_wallclock_ms:
             stop_after_step = step
 
@@ -1176,6 +1226,8 @@ def main() -> None:
     q_eval_ms = 1000.0 * (time.perf_counter() - q_t0)
     log(f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} eval_time:{q_eval_ms:.0f}ms")
     log(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    if wandb_run is not None:
+        wandb_run.finish()
 
 
 if __name__ == "__main__":
