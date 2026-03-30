@@ -255,7 +255,6 @@ def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
 def tensor_token_count(tensor: Tensor) -> int:
     return int(tensor.numel())
 
-
 def eval_val(
     args: Hyperparameters,
     model: nn.Module,
@@ -324,12 +323,7 @@ def eval_val(
     bits_per_token = val_loss.item() / math.log(2.0)
     tokens_per_byte = val_token_count.item() / val_byte_count.item()
     model.train()
-    return (
-        float(val_loss.item()),
-        float(bits_per_token * tokens_per_byte),
-        int(max_batch_token_count_tensor.item()),
-        int(last_batch_token_count_tensor.item()),
-    )
+    return float(val_loss.item()), float(bits_per_token * tokens_per_byte), int(max_batch_token_count_tensor.item()), int(last_batch_token_count_tensor.item())
 
 # -----------------------------
 # POST-TRAINING QUANTIZATION
@@ -363,6 +357,7 @@ INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
+def format_bytes_mib(num_bytes: int) -> str: return f"{num_bytes} bytes ({num_bytes / (1024.0 * 1024.0):.2f} MiB)"
 
 def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, str]) -> Tensor:
     if any(pattern in name for pattern in INT8_KEEP_FLOAT_FP32_NAME_PATTERNS):
@@ -1192,8 +1187,10 @@ def main() -> None:
     if master_process:
         init_quant_bytes, init_quant_raw_bytes, init_quant_stats = estimate_int8_zlib_artifact_bytes(serializable_state)
         log0(
-            f"init_serialized_model_int8_zlib_estimate_in_memory_only:{init_quant_bytes} bytes "
-            f"(payload:{init_quant_stats['int8_payload_bytes']} raw_torch:{init_quant_raw_bytes})"
+            "init_serialized_model_int8_zlib_estimate_in_memory_only:"
+            f"{format_bytes_mib(init_quant_bytes)} "
+            f"(payload:{format_bytes_mib(init_quant_stats['int8_payload_bytes'])} "
+            f"raw_torch:{format_bytes_mib(init_quant_raw_bytes)})"
         )
     first_linear = base_model.blocks[0].attn.c_q
     if isinstance(first_linear, FixedLoRALinear):
@@ -1435,14 +1432,14 @@ def main() -> None:
         torch.save(final_serializable_state, "final_model.pt")
         model_bytes = os.path.getsize("final_model.pt")
         code_bytes = len(code.encode("utf-8"))
-        log0(f"Serialized model: {model_bytes} bytes")
+        log0(f"Serialized model: {format_bytes_mib(model_bytes)}")
         if final_omitted_state:
             log0(
                 f"saved_model_excludes_fixed_weights:true omitted_tensors:{len(final_omitted_state)} "
                 f"omitted_params:{sum(int(tensor.numel()) for tensor in final_omitted_state.values())}"
             )
-        log0(f"Code size: {code_bytes} bytes")
-        log0(f"Total submission size: {model_bytes + code_bytes} bytes")
+        log0(f"Code size: {code_bytes} bytes ({code_bytes / 1_000_000.0:.3f} MB)")
+        log0(f"Total submission size: {model_bytes + code_bytes} bytes ({(model_bytes + code_bytes) / 1_000_000.0:.3f} MB)")
 
     quant_obj, quant_stats = quantize_state_dict_int8(final_serializable_state)
     quant_buf = io.BytesIO()
@@ -1457,10 +1454,11 @@ def main() -> None:
         code_bytes = len(code.encode("utf-8"))
         ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
         log0(
-            f"Serialized model int8+zlib: {quant_file_bytes} bytes "
-            f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
+            f"Serialized model int8+zlib: {format_bytes_mib(quant_file_bytes)} "
+            f"(payload:{format_bytes_mib(quant_stats['int8_payload_bytes'])} "
+            f"raw_torch:{format_bytes_mib(quant_raw_bytes)} payload_ratio:{ratio:.2f}x)"
         )
-        log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
+        log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes ({(quant_file_bytes + code_bytes) / 1_000_000.0:.3f} MB)")
 
     if distributed:
         dist.barrier()
