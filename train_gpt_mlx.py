@@ -74,6 +74,9 @@ class Hyperparameters:
     num_heads: int = int(os.environ.get("NUM_HEADS", 8))
     num_kv_heads: int = int(os.environ.get("NUM_KV_HEADS", 4))
     mlp_mult: int = int(os.environ.get("MLP_MULT", 2))
+    lora_rank: int = int(os.environ.get("LORA_RANK", 16))
+    lora_alpha: float = float(os.environ.get("LORA_ALPHA", 16.0))
+    lora_fixed_seed: int = int(os.environ.get("LORA_FIXED_SEED", os.environ.get("SEED", 1337)))
     tie_embeddings: bool = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     tied_embed_init_std: float = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     logit_chunk_tokens: int = int(os.environ.get("LOGIT_CHUNK_TOKENS", 0))
@@ -163,6 +166,15 @@ def accumulate_flat_grads(
     for k, g in flat.items():
         accum[k] = accum[k] + g * scale
     return accum
+
+
+def derived_seed(base_seed: int, name: str) -> int:
+    return zlib.crc32(name.encode("utf-8"), int(base_seed) & 0xFFFFFFFF) & 0xFFFFFFFF
+
+
+def seeded_normal(shape: tuple[int, ...], seed: int, std: float) -> mx.array:
+    rng = np.random.default_rng(seed)
+    return mx.array(rng.standard_normal(shape).astype(np.float32) * std, dtype=mx.float32)
 
 
 # ==============================================================================
@@ -277,13 +289,35 @@ class TokenLoader:
 # MODEL BLOCKS
 # ==============================================================================
 
-class CastedLinear(nn.Module):
-    def __init__(self, in_dim: int, out_dim: int):
+class FixedLoRALinear(nn.Module):
+    # Frozen random matrix plus a trainable low-rank update. The fixed matrix lives in module state
+    # for serialization/compilation, but freeze() keeps it out of gradient computation.
+    def __init__(self, in_dim: int, out_dim: int, rank: int, alpha: float, seed_name: str, init_seed: int, fixed_seed: int):
         super().__init__()
-        self.weight = nn.Linear(in_dim, out_dim, bias=False).weight.astype(mx.float32)
+        if rank <= 0:
+            raise ValueError(f"lora rank must be positive, got {rank}")
+        self.scale = alpha / rank
+        fixed_std = math.sqrt(2.0 / (in_dim + out_dim))
+        lora_std = 1.0 / math.sqrt(in_dim)
+        self.fixed_weight = seeded_normal(
+            (out_dim, in_dim),
+            derived_seed(fixed_seed, f"{seed_name}.fixed_weight"),
+            fixed_std,
+        )
+        self.lora_down = seeded_normal(
+            (rank, in_dim),
+            derived_seed(init_seed, f"{seed_name}.lora_down"),
+            lora_std,
+        )
+        self.lora_up = mx.zeros((out_dim, rank), dtype=mx.float32)
+        self.freeze(keys="fixed_weight")
 
     def __call__(self, x: mx.array) -> mx.array:
-        return x @ self.weight.astype(x.dtype).T
+        x_cast = x.astype(COMPUTE_DTYPE)
+        fixed_out = x_cast @ self.fixed_weight.astype(x_cast.dtype).T
+        lora_hidden = x_cast @ self.lora_down.astype(x_cast.dtype).T
+        lora_out = lora_hidden @ self.lora_up.astype(x_cast.dtype).T
+        return fixed_out + self.scale * lora_out
 
 
 class RMSNormNoWeight(nn.Module):
@@ -304,6 +338,11 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
+        lora_rank: int,
+        lora_alpha: float,
+        init_seed: int,
+        fixed_seed: int,
+        prefix: str,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -316,10 +355,10 @@ class CausalSelfAttention(nn.Module):
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
         kv_dim = self.num_kv_heads * self.head_dim
-        self.c_q = CastedLinear(dim, dim)
-        self.c_k = CastedLinear(dim, kv_dim)
-        self.c_v = CastedLinear(dim, kv_dim)
-        self.proj = CastedLinear(dim, dim)
+        self.c_q = FixedLoRALinear(dim, dim, lora_rank, lora_alpha, f"{prefix}.c_q", init_seed, fixed_seed)
+        self.c_k = FixedLoRALinear(dim, kv_dim, lora_rank, lora_alpha, f"{prefix}.c_k", init_seed, fixed_seed)
+        self.c_v = FixedLoRALinear(dim, kv_dim, lora_rank, lora_alpha, f"{prefix}.c_v", init_seed, fixed_seed)
+        self.proj = FixedLoRALinear(dim, dim, lora_rank, lora_alpha, f"{prefix}.proj", init_seed, fixed_seed)
         self.q_gain = mx.ones((num_heads,), dtype=mx.float32) * qk_gain_init
         self.rope = nn.RoPE(self.head_dim, traditional=False, base=rope_base)
         self.scale = self.head_dim ** -0.5
@@ -340,11 +379,11 @@ class CausalSelfAttention(nn.Module):
 
 class MLP(nn.Module):
     # Baseline MLP uses relu^2 instead of GELU/SiLU. It is cheap and works well in this setup.
-    def __init__(self, dim: int, mlp_mult: int):
+    def __init__(self, dim: int, mlp_mult: int, lora_rank: int, lora_alpha: float, init_seed: int, fixed_seed: int, prefix: str):
         super().__init__()
         hidden = dim * mlp_mult
-        self.fc = CastedLinear(dim, hidden)
-        self.proj = CastedLinear(hidden, dim)
+        self.fc = FixedLoRALinear(dim, hidden, lora_rank, lora_alpha, f"{prefix}.fc", init_seed, fixed_seed)
+        self.proj = FixedLoRALinear(hidden, dim, lora_rank, lora_alpha, f"{prefix}.proj", init_seed, fixed_seed)
 
     def __call__(self, x: mx.array) -> mx.array:
         x = nn.relu(self.fc(x))
@@ -360,12 +399,29 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        lora_rank: int,
+        lora_alpha: float,
+        init_seed: int,
+        fixed_seed: int,
+        block_idx: int,
     ):
         super().__init__()
         self.attn_norm = RMSNormNoWeight()
         self.mlp_norm = RMSNormNoWeight()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult)
+        prefix = f"blocks.{block_idx}"
+        self.attn = CausalSelfAttention(
+            dim,
+            num_heads,
+            num_kv_heads,
+            rope_base,
+            qk_gain_init,
+            lora_rank,
+            lora_alpha,
+            init_seed,
+            fixed_seed,
+            f"{prefix}.attn",
+        )
+        self.mlp = MLP(dim, mlp_mult, lora_rank, lora_alpha, init_seed, fixed_seed, f"{prefix}.mlp")
         self.attn_scale = mx.ones((dim,), dtype=mx.float32)
         self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
         self.resid_mix = mx.array(np.stack((np.ones((dim,), dtype=np.float32), np.zeros((dim,), dtype=np.float32))))
@@ -385,8 +441,8 @@ class GPT(nn.Module):
     # - decoder half consumes reversed skips with learned skip_weights
     # - tied embeddings for the LM head (the baseline default setup)
     def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
-                 logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
-                 qk_gain_init: float):
+                 lora_rank: int, lora_alpha: float, lora_fixed_seed: int, model_seed: int, logit_chunk_tokens: int,
+                 logit_softcap: float, rope_base: float, tied_embed_init_std: float, qk_gain_init: float):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
@@ -399,16 +455,25 @@ class GPT(nn.Module):
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = mx.ones((self.num_skip_weights, dim), dtype=mx.float32)
         self.blocks = [
-            Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
+            Block(
+                dim,
+                num_heads,
+                num_kv_heads,
+                mlp_mult,
+                rope_base,
+                qk_gain_init,
+                lora_rank,
+                lora_alpha,
+                model_seed,
+                lora_fixed_seed,
+                i,
+            )
             for i in range(num_layers)
         ]
         self.final_norm = RMSNormNoWeight()
-
-        for b in self.blocks:
-            b.attn.proj.weight = mx.zeros_like(b.attn.proj.weight)
-            b.mlp.proj.weight = mx.zeros_like(b.mlp.proj.weight)
+        tok_emb_init = mx.random.normal(self.tok_emb.weight.shape, dtype=mx.float32)
         self.tok_emb.weight = (
-            mx.random.normal(self.tok_emb.weight.shape, dtype=mx.float32) * tied_embed_init_std
+            zeropower_newtonschulz5(tok_emb_init, steps=10) * tied_embed_init_std
         ).astype(COMPUTE_DTYPE)
 
     def softcap(self, logits: mx.array) -> mx.array:
@@ -489,7 +554,7 @@ class SplitOptimizers:
     # This preserves the high-level optimization behavior even though MLX internals differ.
     def __init__(self, model: GPT, args: Hyperparameters):
         self.args = args
-        params = dict(tree_flatten(model.parameters()))
+        params = dict(tree_flatten(model.trainable_parameters()))
         self.embed_key = "tok_emb.weight"
         self.matrix_keys = [
             k
@@ -517,7 +582,7 @@ class SplitOptimizers:
         )
 
     def step(self, model: GPT, grads_tree: dict, step: int, lr_mul: float) -> None:
-        params = dict(tree_flatten(model.parameters()))
+        params = dict(tree_flatten(model.trainable_parameters()))
         grads = dict(tree_flatten(grads_tree))
         updated = dict(params)
 
@@ -892,6 +957,10 @@ def main() -> None:
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
         mlp_mult=args.mlp_mult,
+        lora_rank=args.lora_rank,
+        lora_alpha=args.lora_alpha,
+        lora_fixed_seed=args.lora_fixed_seed,
+        model_seed=args.seed,
         logit_chunk_tokens=args.logit_chunk_tokens,
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
@@ -915,7 +984,8 @@ def main() -> None:
     )
 
     # Print config once so logs are self-describing.
-    n_params = sum(int(np.prod(p.shape)) for _, p in tree_flatten(model.parameters()))
+    total_params = sum(int(np.prod(p.shape)) for _, p in tree_flatten(model.parameters()))
+    trainable_params = sum(int(np.prod(p.shape)) for _, p in tree_flatten(model.trainable_parameters()))
     log(f"run_id:{args.run_id}")
     log(f"mlx_version:{mx.__version__}")
     log(f"train_loader:shards pattern={args.train_files}")
@@ -932,9 +1002,15 @@ def main() -> None:
         log(f"train_loader:dataset:{dataset_name} train_shards:{actual_train_files}/{expected_train_files}")
     log(f"tokenizer_path:{args.tokenizer_path}")
     log(
-        f"model_params:{n_params} vocab_size:{args.vocab_size} layers:{args.num_layers} "
+        f"model_params_total:{total_params} model_params_trainable:{trainable_params} "
+        f"vocab_size:{args.vocab_size} layers:{args.num_layers} "
         f"dim:{args.model_dim} heads:{args.num_heads} kv_heads:{args.num_kv_heads} "
         f"seq_len:{args.train_seq_len} tie_embeddings:{args.tie_embeddings}"
+    )
+    log(
+        f"lora_rank:{args.lora_rank} lora_alpha:{args.lora_alpha} "
+        f"lora_effective_scale:{args.lora_alpha / args.lora_rank:.6f} "
+        f"lora_fixed_seed:{args.lora_fixed_seed}"
     )
     log(
         f"iterations:{args.iterations} train_batch_tokens:{args.train_batch_tokens} grad_accum_steps:{args.grad_accum_steps} "
@@ -953,7 +1029,9 @@ def main() -> None:
     log(f"compute_dtype:{COMPUTE_DTYPE} compile:True")
     log(
         f"dtypes tok_emb:{model.tok_emb.weight.dtype} "
-        f"linear_weight:{model.blocks[0].attn.c_q.weight.dtype} "
+        f"fixed_weight:{model.blocks[0].attn.c_q.fixed_weight.dtype} "
+        f"lora_down:{model.blocks[0].attn.c_q.lora_down.dtype} "
+        f"lora_up:{model.blocks[0].attn.c_q.lora_up.dtype} "
         f"skip_weights:{model.skip_weights.dtype}"
     )
 
