@@ -252,6 +252,10 @@ def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
     return tokens[: usable + 1]
 
 
+def tensor_token_count(tensor: Tensor) -> int:
+    return int(tensor.numel())
+
+
 def eval_val(
     args: Hyperparameters,
     model: nn.Module,
@@ -263,7 +267,7 @@ def eval_val(
     base_bytes_lut: Tensor,
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
-) -> tuple[float, float]:
+) -> tuple[float, float, int, int]:
     # Validation computes two metrics:
     # - val_loss: token cross-entropy (natural log)
     # - val_bpb: tokenizer-agnostic compression metric used by the challenge
@@ -281,6 +285,8 @@ def eval_val(
     val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     val_token_count = torch.zeros((), device=device, dtype=torch.float64)
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
+    max_batch_token_count = 0
+    last_batch_token_count = 0
 
     model.eval()
     with torch.inference_mode():
@@ -293,7 +299,9 @@ def eval_val(
             y = local[1:].reshape(-1, args.train_seq_len)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 batch_loss = model(x, y).detach()
-            batch_token_count = float(y.numel())
+            batch_token_count = tensor_token_count(x)
+            max_batch_token_count = max(max_batch_token_count, batch_token_count)
+            last_batch_token_count = batch_token_count
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
             val_token_count += batch_token_count
             prev_ids = x.reshape(-1)
@@ -306,12 +314,22 @@ def eval_val(
         dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
         dist.all_reduce(val_token_count, op=dist.ReduceOp.SUM)
         dist.all_reduce(val_byte_count, op=dist.ReduceOp.SUM)
+    max_batch_token_count_tensor = torch.tensor(max_batch_token_count, device=device, dtype=torch.int64)
+    last_batch_token_count_tensor = torch.tensor(last_batch_token_count, device=device, dtype=torch.int64)
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(max_batch_token_count_tensor, op=dist.ReduceOp.SUM)
+        dist.all_reduce(last_batch_token_count_tensor, op=dist.ReduceOp.SUM)
 
     val_loss = val_loss_sum / val_token_count
     bits_per_token = val_loss.item() / math.log(2.0)
     tokens_per_byte = val_token_count.item() / val_byte_count.item()
     model.train()
-    return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+    return (
+        float(val_loss.item()),
+        float(bits_per_token * tokens_per_byte),
+        int(max_batch_token_count_tensor.item()),
+        int(last_batch_token_count_tensor.item()),
+    )
 
 # -----------------------------
 # POST-TRAINING QUANTIZATION
@@ -1264,7 +1282,7 @@ def main() -> None:
         if should_validate:
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
-            val_loss, val_bpb = eval_val(
+            val_loss, val_bpb, val_batch_token_count, val_tail_batch_token_count = eval_val(
                 args,
                 model,
                 rank,
@@ -1276,12 +1294,26 @@ def main() -> None:
                 has_leading_space_lut,
                 is_boundary_token_lut,
             )
+            tail_text = (
+                f" val_tail_batch_tensor_tokens:{val_tail_batch_token_count}"
+                if val_tail_batch_token_count != val_batch_token_count
+                else ""
+            )
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
+                f"val_batch_tensor_tokens:{val_batch_token_count}{tail_text} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
             if wandb_run is not None:
-                wandb_run.log({"val_loss": val_loss, "val_bpb": val_bpb}, step=step)
+                wandb_run.log(
+                    {
+                        "val_loss": val_loss,
+                        "val_bpb": val_bpb,
+                        "val_batch_tensor_tokens": val_batch_token_count,
+                        "val_tail_batch_tensor_tokens": val_tail_batch_token_count,
+                    },
+                    step=step,
+                )
             torch.cuda.synchronize()
             t0 = time.perf_counter()
 
@@ -1298,15 +1330,20 @@ def main() -> None:
         step_t0 = time.perf_counter()
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
+        train_batch_token_count_local = 0
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+            train_batch_token_count_local += tensor_token_count(x)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
+        train_batch_token_count = torch.tensor(train_batch_token_count_local, device=device, dtype=torch.int64)
+        if distributed:
+            dist.all_reduce(train_batch_token_count, op=dist.ReduceOp.SUM)
 
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
@@ -1347,6 +1384,7 @@ def main() -> None:
         if wandb_run is not None:
             wandb_payload = {
                 "train_loss": train_loss_value,
+                "train_batch_tensor_tokens": int(train_batch_token_count.item()),
                 "lr_embed": current_embed_lr,
                 "lr_head": current_head_lr,
                 "lr_matrix": current_matrix_lr,
@@ -1364,7 +1402,8 @@ def main() -> None:
             if grad_norm_postclip is not None:
                 grad_text = f" grad_norm:{grad_norm_postclip:.4f}"
             log0(
-                f"step:{step}/{args.iterations} train_loss:{train_loss_value:.4f}{grad_text} "
+                f"step:{step}/{args.iterations} train_loss:{train_loss_value:.4f} "
+                f"train_batch_tensor_tokens:{int(train_batch_token_count.item())}{grad_text} "
                 f"lr_matrix:{current_matrix_lr:.6f} train_time:{approx_training_time_ms:.0f}ms "
                 f"step_avg:{approx_training_time_ms / step:.2f}ms tok_s:{tok_s:.0f}"
             )
@@ -1433,7 +1472,7 @@ def main() -> None:
     base_model.load_state_dict(quant_roundtrip_state, strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
-    q_val_loss, q_val_bpb = eval_val(
+    q_val_loss, q_val_bpb, _, _ = eval_val(
         args,
         model,
         rank,

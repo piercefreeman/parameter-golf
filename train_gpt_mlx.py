@@ -164,6 +164,10 @@ def token_chunks(total_tokens: int, seq_len: int, max_chunk_tokens: int) -> list
     return chunks
 
 
+def tensor_token_count(tensor: mx.array | np.ndarray) -> int:
+    return int(math.prod(tensor.shape))
+
+
 def accumulate_flat_grads(
     accum: dict[str, mx.array] | None,
     grads_tree: dict,
@@ -896,20 +900,23 @@ def loss_and_grad_chunked(
     args: Hyperparameters,
     train_loader: TokenLoader,
     compiled_loss_and_grad,
-) -> tuple[mx.array, dict]:
+) -> tuple[mx.array, dict, int]:
     chunk_sizes = token_chunks(args.microbatch_tokens, args.train_seq_len, args.mlx_max_microbatch_tokens)
     total_tokens = float(sum(chunk_sizes))
     loss_value = mx.array(0.0, dtype=mx.float32)
     grad_accum: dict[str, mx.array] | None = None
+    batch_token_count = 0
     for chunk_tokens in chunk_sizes:
         x, y = train_loader.next_batch(chunk_tokens, args.train_seq_len)
+        chunk_token_count = tensor_token_count(x)
+        batch_token_count += chunk_token_count
         loss, grads = compiled_loss_and_grad(x, y)
-        scale = float(y.size) / total_tokens
+        scale = chunk_token_count / total_tokens
         loss_value = loss_value + loss.astype(mx.float32) * scale
         grad_accum = accumulate_flat_grads(grad_accum, grads, scale)
         if args.mlx_eager_eval:
             mx.eval(loss_value, grad_accum)  # materialize each chunk to cap peak memory
-    return loss_value, tree_unflatten(list(grad_accum.items()))
+    return loss_value, tree_unflatten(list(grad_accum.items())), batch_token_count
 
 
 def eval_val(
@@ -920,7 +927,7 @@ def eval_val(
     has_leading_space_lut: np.ndarray,
     is_boundary_token_lut: np.ndarray,
     log_fn: Callable[[str], None] | None = None,
-) -> tuple[float, float]:
+) -> tuple[float, float, int, int]:
     # Validation computes two metrics:
     # - val_loss: token cross-entropy (natural log)
     # - val_bpb: tokenizer-agnostic compression metric used by the challenge
@@ -937,6 +944,8 @@ def eval_val(
     total_loss_sum = 0.0
     total_tokens = 0.0
     total_bytes = 0.0
+    max_batch_token_count = 0
+    last_batch_token_count = 0
     for batch_idx, batch_seq_start in enumerate(range(0, total_seqs, val_batch_seqs), start=1):
         batch_seq_end = min(batch_seq_start + val_batch_seqs, total_seqs)
         raw_start = batch_seq_start * args.train_seq_len
@@ -946,26 +955,28 @@ def eval_val(
         y_np = chunk[1:].reshape(-1, args.train_seq_len)
         x = mx.array(x_np, dtype=mx.int32)
         y = mx.array(y_np, dtype=mx.int32)
-        chunk_token_count = float(y.size)
+        chunk_token_count = tensor_token_count(x_np)
+        max_batch_token_count = max(max_batch_token_count, chunk_token_count)
+        last_batch_token_count = chunk_token_count
         batch_loss = compiled_loss(x, y).astype(mx.float32)
         mx.eval(batch_loss)
-        total_loss_sum += float(batch_loss.item()) * chunk_token_count
+        total_loss_sum += float(batch_loss.item()) * float(chunk_token_count)
         prev_ids = x_np.reshape(-1)
         tgt_ids = y_np.reshape(-1)
         bytes_np = base_bytes_lut[tgt_ids].astype(np.int16, copy=True)
         bytes_np += (
             has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]
         ).astype(np.int16, copy=False)
-        total_tokens += chunk_token_count
+        total_tokens += float(chunk_token_count)
         total_bytes += float(bytes_np.astype(np.float64).sum())
         if log_fn is not None and total_batches > 1 and (
             batch_idx == 1 or batch_idx == total_batches or batch_idx % 25 == 0
         ):
-            log_fn(f"val_progress:{batch_idx}/{total_batches}")
+            log_fn(f"val_progress:{batch_idx}/{total_batches} val_batch_tensor_tokens:{chunk_token_count}")
     val_loss = total_loss_sum / total_tokens
     bits_per_token = val_loss / math.log(2.0)
     val_bpb = bits_per_token * (total_tokens / total_bytes)
-    return val_loss, val_bpb
+    return val_loss, val_bpb, max_batch_token_count, last_batch_token_count
 
 # -----------------------------
 # TRAINING
@@ -1204,7 +1215,7 @@ def main() -> None:
             warmup_loss = mx.array(0.0, dtype=mx.float32)
             grad_scale = 1.0 / args.grad_accum_steps
             for _ in range(args.grad_accum_steps):
-                warmup_loss, grads = loss_and_grad_chunked(args, train_loader, compiled_loss_and_grad)
+                warmup_loss, grads, _ = loss_and_grad_chunked(args, train_loader, compiled_loss_and_grad)
                 accum = accumulate_flat_grads(accum, grads, grad_scale)
             mx.eval(warmup_loss, accum)
             mx.synchronize()
@@ -1239,7 +1250,7 @@ def main() -> None:
         if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
             train_time_ms += 1000.0 * (time.perf_counter() - t0)
             # Validation always scans the same fixed full validation split.
-            val_loss, val_bpb = eval_val(
+            val_loss, val_bpb, val_batch_token_count, val_tail_batch_token_count = eval_val(
                 args,
                 compiled_loss,
                 val_tokens,
@@ -1249,12 +1260,26 @@ def main() -> None:
                 log_fn=log,
             )
             if step % 25 == 0 or last_step:
+                tail_text = (
+                    f" val_tail_batch_tensor_tokens:{val_tail_batch_token_count}"
+                    if val_tail_batch_token_count != val_batch_token_count
+                    else ""
+                )
                 log(
                     f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
+                    f"val_batch_tensor_tokens:{val_batch_token_count}{tail_text} "
                     f"train_time:{train_time_ms:.0f}ms step_avg:{train_time_ms / max(step, 1):.2f}ms"
                 )
             if wandb_run is not None:
-                wandb_run.log({"val_loss": val_loss}, step=step)
+                wandb_run.log(
+                    {
+                        "val_loss": val_loss,
+                        "val_bpb": val_bpb,
+                        "val_batch_tensor_tokens": val_batch_token_count,
+                        "val_tail_batch_tensor_tokens": val_tail_batch_token_count,
+                    },
+                    step=step,
+                )
             t0 = time.perf_counter()
         if last_step:
             if stop_after_step is not None and step < args.iterations:
@@ -1266,11 +1291,13 @@ def main() -> None:
 
         accum: dict[str, mx.array] | None = None
         train_loss = mx.array(0.0, dtype=mx.float32)
+        train_batch_token_count = 0
         grad_scale = 1.0 / args.grad_accum_steps
         for _ in range(args.grad_accum_steps):
-            loss, grads = loss_and_grad_chunked(args, train_loader, compiled_loss_and_grad)
+            loss, grads, microbatch_token_count = loss_and_grad_chunked(args, train_loader, compiled_loss_and_grad)
             accum = accumulate_flat_grads(accum, grads, grad_scale)
             train_loss = train_loss + loss.astype(mx.float32) * grad_scale
+            train_batch_token_count += microbatch_token_count
             if args.mlx_eager_eval:
                 mx.eval(train_loss, accum)  # materialize each microbatch to cap peak memory
 
@@ -1291,6 +1318,7 @@ def main() -> None:
             wandb_run.log(
                 {
                     "train_loss": train_loss_value,
+                    "train_batch_tensor_tokens": train_batch_token_count,
                     "grad_norm_preclip": grad_norm_preclip,
                     "grad_norm_postclip": grad_norm_postclip,
                     "lr_embed": current_embed_lr,
@@ -1303,6 +1331,7 @@ def main() -> None:
         if args.train_log_every > 0 and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None):
             log(
                 f"step:{step}/{args.iterations} train_loss:{train_loss_value:.4f} "
+                f"train_batch_tensor_tokens:{train_batch_token_count} "
                 f"grad_norm:{grad_norm_postclip:.4f} lr_matrix:{current_matrix_lr:.6f} "
                 f"train_time:{approx_train_time_ms:.0f}ms step_avg:{approx_train_time_ms / step:.2f}ms tok_s:{tok_s:.0f}"
             )
@@ -1348,7 +1377,7 @@ def main() -> None:
     quant_flat = dequantize_state_dict_int8(pickle.loads(zlib.decompress(quant_blob_disk)))
     model.update(tree_unflatten(list(quant_flat.items())))
     q_t0 = time.perf_counter()
-    q_val_loss, q_val_bpb = eval_val(
+    q_val_loss, q_val_bpb, _, _ = eval_val(
         args,
         compiled_loss,
         val_tokens,
