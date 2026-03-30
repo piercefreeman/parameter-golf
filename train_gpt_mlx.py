@@ -809,6 +809,17 @@ def estimate_int8_zlib_artifact_bytes(flat_state: dict[str, mx.array]) -> tuple[
     return len(quant_blob), len(quant_raw), quant_stats
 
 
+def split_serialized_state(flat_state: dict[str, mx.array]) -> tuple[dict[str, mx.array], dict[str, mx.array]]:
+    serializable: dict[str, mx.array] = {}
+    omitted: dict[str, mx.array] = {}
+    for name, arr in flat_state.items():
+        if name.endswith(".fixed_weight"):
+            omitted[name] = arr
+        else:
+            serializable[name] = arr
+    return serializable, omitted
+
+
 def build_sentencepiece_luts(
     sp: spm.SentencePieceProcessor, vocab_size: int
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -1104,6 +1115,10 @@ def main() -> None:
     # Print config once so logs are self-describing.
     total_params = sum(int(np.prod(p.shape)) for _, p in tree_flatten(model.parameters()))
     trainable_params = sum(int(np.prod(p.shape)) for _, p in tree_flatten(model.trainable_parameters()))
+    init_full_state = {k: v for k, v in tree_flatten(model.state)}
+    init_serializable_state, init_omitted_state = split_serialized_state(init_full_state)
+    init_quant_bytes, init_quant_raw_bytes, init_quant_stats = estimate_int8_zlib_artifact_bytes(init_serializable_state)
+    omitted_fixed_weight_params = sum(int(arr.size) for arr in init_omitted_state.values())
     log(f"run_id:{args.run_id}")
     log(f"mlx_version:{mx.__version__}")
     log(f"train_loader:shards pattern={args.train_files}")
@@ -1124,6 +1139,19 @@ def main() -> None:
         f"vocab_size:{args.vocab_size} layers:{args.num_layers} "
         f"dim:{args.model_dim} heads:{args.num_heads} kv_heads:{args.num_kv_heads} "
         f"seq_len:{args.train_seq_len} tie_embeddings:{args.tie_embeddings}"
+    )
+    log(f"trainable_params:{trainable_params}")
+    log(
+        f"serialized_params:{sum(int(arr.size) for arr in init_serializable_state.values())} "
+        f"omitted_fixed_weight_params:{omitted_fixed_weight_params} "
+        f"omitted_fixed_weight_tensors:{len(init_omitted_state)}"
+    )
+    log(
+        f"init_serialized_model_int8_zlib_estimate_in_memory_only:{init_quant_bytes} bytes "
+        f"({init_quant_bytes / (1024.0 * 1024.0):.2f} MiB) "
+        f"(payload:{init_quant_stats['int8_payload_bytes']} bytes "
+        f"{init_quant_stats['int8_payload_bytes'] / (1024.0 * 1024.0):.2f} MiB "
+        f"raw_pickle:{init_quant_raw_bytes} bytes {init_quant_raw_bytes / (1024.0 * 1024.0):.2f} MiB)"
     )
     log(f"linear_impl:{args.linear_impl}")
     if args.linear_impl == "fixed_lora":
@@ -1288,11 +1316,18 @@ def main() -> None:
     # ==============================================================================
     # We always write a raw artifact and a quantized artifact, then validate the
     # quantized roundtrip directly by loading the dequantized tensors back into the
-    # model and running one final validation pass.
+    # model and running one final validation pass. Reconstructible frozen random
+    # weights are omitted from serialization and regenerated from seed at model init.
     out_path = out_dir / f"{args.run_id}_mlx_model.npz"
-    flat_state = {k: v for k, v in tree_flatten(model.state)}
+    full_state = {k: v for k, v in tree_flatten(model.state)}
+    flat_state, omitted_state = split_serialized_state(full_state)
     mx.savez(str(out_path), **flat_state)
     log(f"saved_model:{out_path} bytes:{out_path.stat().st_size}")
+    if omitted_state:
+        log(
+            f"saved_model_excludes_fixed_weights:true omitted_tensors:{len(omitted_state)} "
+            f"omitted_params:{sum(int(arr.size) for arr in omitted_state.values())}"
+        )
 
     quant_obj, quant_stats = quantize_state_dict_int8(flat_state)
     quant_raw = pickle.dumps(quant_obj, protocol=pickle.HIGHEST_PROTOCOL)
