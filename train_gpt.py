@@ -602,19 +602,18 @@ class FixedLoRALinear(nn.Module):
         seed_name: str,
         init_seed: int,
         fixed_seed: int,
+        shared_fixed_weights: dict[tuple[int, int], Tensor],
         device: torch.device,
     ):
         super().__init__()
         if rank <= 0:
             raise ValueError(f"lora rank must be positive, got {rank}")
         self.scale = alpha / rank
-        fixed_weight = seeded_normal(
-            (out_dim, in_dim),
-            derived_seed(fixed_seed, f"{seed_name}.fixed_weight"),
-            1.0,
-            device,
-        )
-        self.register_buffer("fixed_weight", orthogonalize_init_matrix(fixed_weight, steps=10))
+        fixed_weight_key = (out_dim, in_dim)
+        if fixed_weight_key not in shared_fixed_weights:
+            fixed_weight = seeded_normal((out_dim, in_dim), derived_seed(fixed_seed, f"shared_fixed_weight.{out_dim}x{in_dim}"), 1.0, device)
+            shared_fixed_weights[fixed_weight_key] = orthogonalize_init_matrix(fixed_weight, steps=10).to(dtype=torch.bfloat16)
+        self.register_buffer("fixed_weight", shared_fixed_weights[fixed_weight_key])
         self.lora_down = nn.Parameter(
             seeded_normal(
                 (rank, in_dim),
@@ -631,7 +630,6 @@ class FixedLoRALinear(nn.Module):
         lora_out = F.linear(lora_hidden, self.lora_up.to(x.dtype))
         return fixed_out + self.scale * lora_out
 
-
 def build_linear(
     linear_impl: str,
     in_dim: int,
@@ -641,14 +639,14 @@ def build_linear(
     seed_name: str,
     init_seed: int,
     fixed_seed: int,
+    shared_fixed_weights: dict[tuple[int, int], Tensor],
     device: torch.device,
 ) -> nn.Module:
     if linear_impl == "linear":
         return CastedLinear(in_dim, out_dim, bias=False, device=device)
     if linear_impl == "fixed_lora":
-        return FixedLoRALinear(in_dim, out_dim, lora_rank, lora_alpha, seed_name, init_seed, fixed_seed, device)
+        return FixedLoRALinear(in_dim, out_dim, lora_rank, lora_alpha, seed_name, init_seed, fixed_seed, shared_fixed_weights, device)
     raise ValueError(f"LINEAR_IMPL must be one of {LINEAR_IMPL_CHOICES}, got {linear_impl}")
-
 
 def zero_projection_update(layer: nn.Module) -> None:
     with torch.no_grad():
@@ -660,9 +658,7 @@ def zero_projection_update(layer: nn.Module) -> None:
             return
     raise TypeError(f"Unsupported projection layer type: {type(layer)!r}")
 
-
 class Rotary(nn.Module):
-    # Caches cos/sin tables per sequence length on the current device.
     def __init__(self, dim: int, base: float = 10000.0, device: torch.device | None = None):
         super().__init__()
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, device=device, dtype=torch.float32) / dim))
@@ -685,12 +681,10 @@ class Rotary(nn.Module):
             self._seq_len_cached = seq_len
         return self._cos_cached.to(dtype=dtype), self._sin_cached.to(dtype=dtype)
 
-
 def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     half = x.size(-1) // 2
     x1, x2 = x[..., :half], x[..., half:]
     return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
-
 
 class CausalSelfAttention(nn.Module):
     def __init__(
@@ -705,6 +699,7 @@ class CausalSelfAttention(nn.Module):
         lora_alpha: float,
         init_seed: int,
         fixed_seed: int,
+        shared_fixed_weights: dict[tuple[int, int], Tensor],
         prefix: str,
         device: torch.device,
     ):
@@ -719,10 +714,10 @@ class CausalSelfAttention(nn.Module):
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
         kv_dim = self.num_kv_heads * self.head_dim
-        self.c_q = build_linear(linear_impl, dim, dim, lora_rank, lora_alpha, f"{prefix}.c_q", init_seed, fixed_seed, device)
-        self.c_k = build_linear(linear_impl, dim, kv_dim, lora_rank, lora_alpha, f"{prefix}.c_k", init_seed, fixed_seed, device)
-        self.c_v = build_linear(linear_impl, dim, kv_dim, lora_rank, lora_alpha, f"{prefix}.c_v", init_seed, fixed_seed, device)
-        self.proj = build_linear(linear_impl, dim, dim, lora_rank, lora_alpha, f"{prefix}.proj", init_seed, fixed_seed, device)
+        self.c_q = build_linear(linear_impl, dim, dim, lora_rank, lora_alpha, f"{prefix}.c_q", init_seed, fixed_seed, shared_fixed_weights, device)
+        self.c_k = build_linear(linear_impl, dim, kv_dim, lora_rank, lora_alpha, f"{prefix}.c_k", init_seed, fixed_seed, shared_fixed_weights, device)
+        self.c_v = build_linear(linear_impl, dim, kv_dim, lora_rank, lora_alpha, f"{prefix}.c_v", init_seed, fixed_seed, shared_fixed_weights, device)
+        self.proj = build_linear(linear_impl, dim, dim, lora_rank, lora_alpha, f"{prefix}.proj", init_seed, fixed_seed, shared_fixed_weights, device)
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, device=device, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base, device=device)
 
@@ -748,9 +743,7 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
-
 class MLP(nn.Module):
-    # relu^2 MLP from the original modded-nanogpt setup
     def __init__(
         self,
         dim: int,
@@ -760,18 +753,18 @@ class MLP(nn.Module):
         lora_alpha: float,
         init_seed: int,
         fixed_seed: int,
+        shared_fixed_weights: dict[tuple[int, int], Tensor],
         prefix: str,
         device: torch.device,
     ):
         super().__init__()
         hidden = mlp_mult * dim
-        self.fc = build_linear(linear_impl, dim, hidden, lora_rank, lora_alpha, f"{prefix}.fc", init_seed, fixed_seed, device)
-        self.proj = build_linear(linear_impl, hidden, dim, lora_rank, lora_alpha, f"{prefix}.proj", init_seed, fixed_seed, device)
+        self.fc = build_linear(linear_impl, dim, hidden, lora_rank, lora_alpha, f"{prefix}.fc", init_seed, fixed_seed, shared_fixed_weights, device)
+        self.proj = build_linear(linear_impl, hidden, dim, lora_rank, lora_alpha, f"{prefix}.proj", init_seed, fixed_seed, shared_fixed_weights, device)
 
     def forward(self, x: Tensor) -> Tensor:
         x = torch.relu(self.fc(x))
         return self.proj(x.square())
-
 
 class Block(nn.Module):
     def __init__(
@@ -787,6 +780,7 @@ class Block(nn.Module):
         lora_alpha: float,
         init_seed: int,
         fixed_seed: int,
+        shared_fixed_weights: dict[tuple[int, int], Tensor],
         block_idx: int,
         device: torch.device,
     ):
@@ -805,10 +799,11 @@ class Block(nn.Module):
             lora_alpha,
             init_seed,
             fixed_seed,
+            shared_fixed_weights,
             f"{prefix}.attn",
             device,
         )
-        self.mlp = MLP(dim, mlp_mult, linear_impl, lora_rank, lora_alpha, init_seed, fixed_seed, f"{prefix}.mlp", device)
+        self.mlp = MLP(dim, mlp_mult, linear_impl, lora_rank, lora_alpha, init_seed, fixed_seed, shared_fixed_weights, f"{prefix}.mlp", device)
         self.attn_scale = nn.Parameter(torch.ones(dim, device=device, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, device=device, dtype=torch.float32))
         self.resid_mix = nn.Parameter(
@@ -827,7 +822,6 @@ class Block(nn.Module):
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
-
 
 class GPT(nn.Module):
     def __init__(
@@ -861,6 +855,7 @@ class GPT(nn.Module):
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, device=device, dtype=torch.float32))
+        shared_fixed_weights: dict[tuple[int, int], Tensor] = {}
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -875,6 +870,7 @@ class GPT(nn.Module):
                     lora_alpha,
                     model_seed,
                     lora_fixed_seed,
+                    shared_fixed_weights,
                     i,
                     device,
                 )
