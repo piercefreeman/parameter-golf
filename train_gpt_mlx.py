@@ -26,6 +26,11 @@ import mlx.nn as nn
 import mlx.optimizers as optim
 from mlx.utils import tree_flatten, tree_unflatten
 
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
 # ==============================================================================
 # SHARD FORMAT + COMPUTE DTYPE
 # ==============================================================================
@@ -46,6 +51,9 @@ class Hyperparameters:
     tokenizer_path: str = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model")
     run_id: str = os.environ.get("RUN_ID", str(uuid.uuid4()))
     seed: int = int(os.environ.get("SEED", 1337))
+    wandb_enabled: bool = bool(int(os.environ.get("WANDB_ENABLED", "1")))
+    wandb_project: str = os.environ.get("WANDB_PROJECT", "parameter-golf-mlx")
+    wandb_entity: str | None = os.environ.get("WANDB_ENTITY")
 
     # Training loop. These defaults now mirror train_gpt.py on a single process.
     iterations: int = int(os.environ.get("ITERATIONS", 20_000))
@@ -74,6 +82,7 @@ class Hyperparameters:
     num_heads: int = int(os.environ.get("NUM_HEADS", 8))
     num_kv_heads: int = int(os.environ.get("NUM_KV_HEADS", 4))
     mlp_mult: int = int(os.environ.get("MLP_MULT", 2))
+    linear_impl: str = os.environ.get("LINEAR_IMPL", "fixed_lora")
     lora_rank: int = int(os.environ.get("LORA_RANK", 16))
     lora_alpha: float = float(os.environ.get("LORA_ALPHA", 16.0))
     lora_fixed_seed: int = int(os.environ.get("LORA_FIXED_SEED", os.environ.get("SEED", 1337)))
@@ -153,6 +162,10 @@ def token_chunks(total_tokens: int, seq_len: int, max_chunk_tokens: int) -> list
         chunks.append(chunk)
         remaining -= chunk
     return chunks
+
+
+def tensor_token_count(tensor: mx.array | np.ndarray) -> int:
+    return int(math.prod(tensor.shape))
 
 
 def accumulate_flat_grads(
@@ -289,6 +302,20 @@ class TokenLoader:
 # MODEL BLOCKS
 # ==============================================================================
 
+LINEAR_IMPL_CHOICES = ("linear", "fixed_lora")
+
+
+class CastedLinear(nn.Module):
+    # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
+    def __init__(self, in_dim: int, out_dim: int):
+        super().__init__()
+        self.weight = nn.Linear(in_dim, out_dim, bias=False).weight.astype(mx.float32)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        x_cast = x.astype(COMPUTE_DTYPE)
+        return x_cast @ self.weight.astype(x_cast.dtype).T
+
+
 class FixedLoRALinear(nn.Module):
     # Frozen random matrix plus a trainable low-rank update. The fixed matrix lives in module state
     # for serialization/compilation, but freeze() keeps it out of gradient computation.
@@ -297,19 +324,21 @@ class FixedLoRALinear(nn.Module):
         if rank <= 0:
             raise ValueError(f"lora rank must be positive, got {rank}")
         self.scale = alpha / rank
-        fixed_std = math.sqrt(2.0 / (in_dim + out_dim))
         lora_std = 1.0 / math.sqrt(in_dim)
-        self.fixed_weight = seeded_normal(
+        fixed_weight_init = seeded_normal(
             (out_dim, in_dim),
             derived_seed(fixed_seed, f"{seed_name}.fixed_weight"),
-            fixed_std,
+            1.0,
         )
+        self.fixed_weight = zeropower_newtonschulz5(fixed_weight_init, steps=10).astype(mx.float32)
         self.lora_down = seeded_normal(
             (rank, in_dim),
             derived_seed(init_seed, f"{seed_name}.lora_down"),
             lora_std,
         )
         self.lora_up = mx.zeros((out_dim, rank), dtype=mx.float32)
+        # we *NEVER* want to train on the weight size, instead preferring it to be
+        # restored by our deterministic process at inference time
         self.freeze(keys="fixed_weight")
 
     def __call__(self, x: mx.array) -> mx.array:
@@ -318,6 +347,33 @@ class FixedLoRALinear(nn.Module):
         lora_hidden = x_cast @ self.lora_down.astype(x_cast.dtype).T
         lora_out = lora_hidden @ self.lora_up.astype(x_cast.dtype).T
         return fixed_out + self.scale * lora_out
+
+
+def build_linear(
+    linear_impl: str,
+    in_dim: int,
+    out_dim: int,
+    lora_rank: int,
+    lora_alpha: float,
+    seed_name: str,
+    init_seed: int,
+    fixed_seed: int,
+) -> nn.Module:
+    if linear_impl == "linear":
+        return CastedLinear(in_dim, out_dim)
+    if linear_impl == "fixed_lora":
+        return FixedLoRALinear(in_dim, out_dim, lora_rank, lora_alpha, seed_name, init_seed, fixed_seed)
+    raise ValueError(f"LINEAR_IMPL must be one of {LINEAR_IMPL_CHOICES}, got {linear_impl}")
+
+
+def zero_projection_update(layer: nn.Module) -> None:
+    if isinstance(layer, CastedLinear):
+        layer.weight = mx.zeros_like(layer.weight)
+        return
+    if isinstance(layer, FixedLoRALinear):
+        layer.lora_up = mx.zeros_like(layer.lora_up)
+        return
+    raise TypeError(f"Unsupported projection layer type: {type(layer)!r}")
 
 
 class RMSNormNoWeight(nn.Module):
@@ -338,6 +394,7 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
+        linear_impl: str,
         lora_rank: int,
         lora_alpha: float,
         init_seed: int,
@@ -355,10 +412,10 @@ class CausalSelfAttention(nn.Module):
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
         kv_dim = self.num_kv_heads * self.head_dim
-        self.c_q = FixedLoRALinear(dim, dim, lora_rank, lora_alpha, f"{prefix}.c_q", init_seed, fixed_seed)
-        self.c_k = FixedLoRALinear(dim, kv_dim, lora_rank, lora_alpha, f"{prefix}.c_k", init_seed, fixed_seed)
-        self.c_v = FixedLoRALinear(dim, kv_dim, lora_rank, lora_alpha, f"{prefix}.c_v", init_seed, fixed_seed)
-        self.proj = FixedLoRALinear(dim, dim, lora_rank, lora_alpha, f"{prefix}.proj", init_seed, fixed_seed)
+        self.c_q = build_linear(linear_impl, dim, dim, lora_rank, lora_alpha, f"{prefix}.c_q", init_seed, fixed_seed)
+        self.c_k = build_linear(linear_impl, dim, kv_dim, lora_rank, lora_alpha, f"{prefix}.c_k", init_seed, fixed_seed)
+        self.c_v = build_linear(linear_impl, dim, kv_dim, lora_rank, lora_alpha, f"{prefix}.c_v", init_seed, fixed_seed)
+        self.proj = build_linear(linear_impl, dim, dim, lora_rank, lora_alpha, f"{prefix}.proj", init_seed, fixed_seed)
         self.q_gain = mx.ones((num_heads,), dtype=mx.float32) * qk_gain_init
         self.rope = nn.RoPE(self.head_dim, traditional=False, base=rope_base)
         self.scale = self.head_dim ** -0.5
@@ -379,11 +436,21 @@ class CausalSelfAttention(nn.Module):
 
 class MLP(nn.Module):
     # Baseline MLP uses relu^2 instead of GELU/SiLU. It is cheap and works well in this setup.
-    def __init__(self, dim: int, mlp_mult: int, lora_rank: int, lora_alpha: float, init_seed: int, fixed_seed: int, prefix: str):
+    def __init__(
+        self,
+        dim: int,
+        mlp_mult: int,
+        linear_impl: str,
+        lora_rank: int,
+        lora_alpha: float,
+        init_seed: int,
+        fixed_seed: int,
+        prefix: str,
+    ):
         super().__init__()
         hidden = dim * mlp_mult
-        self.fc = FixedLoRALinear(dim, hidden, lora_rank, lora_alpha, f"{prefix}.fc", init_seed, fixed_seed)
-        self.proj = FixedLoRALinear(hidden, dim, lora_rank, lora_alpha, f"{prefix}.proj", init_seed, fixed_seed)
+        self.fc = build_linear(linear_impl, dim, hidden, lora_rank, lora_alpha, f"{prefix}.fc", init_seed, fixed_seed)
+        self.proj = build_linear(linear_impl, hidden, dim, lora_rank, lora_alpha, f"{prefix}.proj", init_seed, fixed_seed)
 
     def __call__(self, x: mx.array) -> mx.array:
         x = nn.relu(self.fc(x))
@@ -399,6 +466,7 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        linear_impl: str,
         lora_rank: int,
         lora_alpha: float,
         init_seed: int,
@@ -415,13 +483,14 @@ class Block(nn.Module):
             num_kv_heads,
             rope_base,
             qk_gain_init,
+            linear_impl,
             lora_rank,
             lora_alpha,
             init_seed,
             fixed_seed,
             f"{prefix}.attn",
         )
-        self.mlp = MLP(dim, mlp_mult, lora_rank, lora_alpha, init_seed, fixed_seed, f"{prefix}.mlp")
+        self.mlp = MLP(dim, mlp_mult, linear_impl, lora_rank, lora_alpha, init_seed, fixed_seed, f"{prefix}.mlp")
         self.attn_scale = mx.ones((dim,), dtype=mx.float32)
         self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
         self.resid_mix = mx.array(np.stack((np.ones((dim,), dtype=np.float32), np.zeros((dim,), dtype=np.float32))))
@@ -441,8 +510,9 @@ class GPT(nn.Module):
     # - decoder half consumes reversed skips with learned skip_weights
     # - tied embeddings for the LM head (the baseline default setup)
     def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
-                 lora_rank: int, lora_alpha: float, lora_fixed_seed: int, model_seed: int, logit_chunk_tokens: int,
-                 logit_softcap: float, rope_base: float, tied_embed_init_std: float, qk_gain_init: float):
+                 linear_impl: str, lora_rank: int, lora_alpha: float, lora_fixed_seed: int, model_seed: int,
+                 logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
+                 qk_gain_init: float):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
@@ -462,6 +532,7 @@ class GPT(nn.Module):
                 mlp_mult,
                 rope_base,
                 qk_gain_init,
+                linear_impl,
                 lora_rank,
                 lora_alpha,
                 model_seed,
@@ -471,6 +542,10 @@ class GPT(nn.Module):
             for i in range(num_layers)
         ]
         self.final_norm = RMSNormNoWeight()
+
+        for b in self.blocks:
+            zero_projection_update(b.attn.proj)
+            zero_projection_update(b.mlp.proj)
         tok_emb_init = mx.random.normal(self.tok_emb.weight.shape, dtype=mx.float32)
         self.tok_emb.weight = (
             zeropower_newtonschulz5(tok_emb_init, steps=10) * tied_embed_init_std
@@ -731,6 +806,24 @@ def dequantize_state_dict_int8(quant_obj: dict[str, object]) -> dict[str, mx.arr
     return out
 
 
+def estimate_int8_zlib_artifact_bytes(flat_state: dict[str, mx.array]) -> tuple[int, int, dict[str, int]]:
+    quant_obj, quant_stats = quantize_state_dict_int8(flat_state)
+    quant_raw = pickle.dumps(quant_obj, protocol=pickle.HIGHEST_PROTOCOL)
+    quant_blob = zlib.compress(quant_raw, level=9)
+    return len(quant_blob), len(quant_raw), quant_stats
+
+
+def split_serialized_state(flat_state: dict[str, mx.array]) -> tuple[dict[str, mx.array], dict[str, mx.array]]:
+    serializable: dict[str, mx.array] = {}
+    omitted: dict[str, mx.array] = {}
+    for name, arr in flat_state.items():
+        if name.endswith(".fixed_weight"):
+            omitted[name] = arr
+        else:
+            serializable[name] = arr
+    return serializable, omitted
+
+
 def build_sentencepiece_luts(
     sp: spm.SentencePieceProcessor, vocab_size: int
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -807,20 +900,23 @@ def loss_and_grad_chunked(
     args: Hyperparameters,
     train_loader: TokenLoader,
     compiled_loss_and_grad,
-) -> tuple[mx.array, dict]:
+) -> tuple[mx.array, dict, int]:
     chunk_sizes = token_chunks(args.microbatch_tokens, args.train_seq_len, args.mlx_max_microbatch_tokens)
     total_tokens = float(sum(chunk_sizes))
     loss_value = mx.array(0.0, dtype=mx.float32)
     grad_accum: dict[str, mx.array] | None = None
+    batch_token_count = 0
     for chunk_tokens in chunk_sizes:
         x, y = train_loader.next_batch(chunk_tokens, args.train_seq_len)
+        chunk_token_count = tensor_token_count(x)
+        batch_token_count += chunk_token_count
         loss, grads = compiled_loss_and_grad(x, y)
-        scale = float(y.size) / total_tokens
+        scale = chunk_token_count / total_tokens
         loss_value = loss_value + loss.astype(mx.float32) * scale
         grad_accum = accumulate_flat_grads(grad_accum, grads, scale)
         if args.mlx_eager_eval:
             mx.eval(loss_value, grad_accum)  # materialize each chunk to cap peak memory
-    return loss_value, tree_unflatten(list(grad_accum.items()))
+    return loss_value, tree_unflatten(list(grad_accum.items())), batch_token_count
 
 
 def eval_val(
@@ -831,7 +927,7 @@ def eval_val(
     has_leading_space_lut: np.ndarray,
     is_boundary_token_lut: np.ndarray,
     log_fn: Callable[[str], None] | None = None,
-) -> tuple[float, float]:
+) -> tuple[float, float, int, int]:
     # Validation computes two metrics:
     # - val_loss: token cross-entropy (natural log)
     # - val_bpb: tokenizer-agnostic compression metric used by the challenge
@@ -848,6 +944,8 @@ def eval_val(
     total_loss_sum = 0.0
     total_tokens = 0.0
     total_bytes = 0.0
+    max_batch_token_count = 0
+    last_batch_token_count = 0
     for batch_idx, batch_seq_start in enumerate(range(0, total_seqs, val_batch_seqs), start=1):
         batch_seq_end = min(batch_seq_start + val_batch_seqs, total_seqs)
         raw_start = batch_seq_start * args.train_seq_len
@@ -857,45 +955,66 @@ def eval_val(
         y_np = chunk[1:].reshape(-1, args.train_seq_len)
         x = mx.array(x_np, dtype=mx.int32)
         y = mx.array(y_np, dtype=mx.int32)
-        chunk_token_count = float(y.size)
+        chunk_token_count = tensor_token_count(x_np)
+        max_batch_token_count = max(max_batch_token_count, chunk_token_count)
+        last_batch_token_count = chunk_token_count
         batch_loss = compiled_loss(x, y).astype(mx.float32)
         mx.eval(batch_loss)
-        total_loss_sum += float(batch_loss.item()) * chunk_token_count
+        total_loss_sum += float(batch_loss.item()) * float(chunk_token_count)
         prev_ids = x_np.reshape(-1)
         tgt_ids = y_np.reshape(-1)
         bytes_np = base_bytes_lut[tgt_ids].astype(np.int16, copy=True)
         bytes_np += (
             has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]
         ).astype(np.int16, copy=False)
-        total_tokens += chunk_token_count
+        total_tokens += float(chunk_token_count)
         total_bytes += float(bytes_np.astype(np.float64).sum())
         if log_fn is not None and total_batches > 1 and (
             batch_idx == 1 or batch_idx == total_batches or batch_idx % 25 == 0
         ):
-            log_fn(f"val_progress:{batch_idx}/{total_batches}")
+            log_fn(f"val_progress:{batch_idx}/{total_batches} val_batch_tensor_tokens:{chunk_token_count}")
     val_loss = total_loss_sum / total_tokens
     bits_per_token = val_loss / math.log(2.0)
     val_bpb = bits_per_token * (total_tokens / total_bytes)
-    return val_loss, val_bpb
+    return val_loss, val_bpb, max_batch_token_count, last_batch_token_count
 
 # -----------------------------
 # TRAINING
 # -----------------------------
 
-def clip_grad_tree(grads_tree: dict, max_norm: float) -> dict:
-    if max_norm <= 0:
-        return grads_tree
+def clip_grad_tree(grads_tree: dict, max_norm: float) -> tuple[dict, float, float]:
     flat = dict(tree_flatten(grads_tree))
     total_sq = 0.0
     for grad in flat.values():
         total_sq += float(np.sum(np.square(_np_float32(grad)), dtype=np.float64))
-    if total_sq <= 0.0:
-        return grads_tree
-    total_norm = math.sqrt(total_sq)
-    if total_norm <= max_norm:
-        return grads_tree
+    total_norm = math.sqrt(total_sq) if total_sq > 0.0 else 0.0
+    if max_norm <= 0 or total_norm <= 0.0 or total_norm <= max_norm:
+        return grads_tree, total_norm, total_norm
     scale = max_norm / (total_norm + 1e-12)
-    return tree_unflatten([(k, g * scale) for k, g in flat.items()])
+    clipped = tree_unflatten([(k, g * scale) for k, g in flat.items()])
+    return clipped, total_norm, total_norm * scale
+
+
+def wandb_config(args: Hyperparameters) -> dict[str, object]:
+    return {
+        "run_id": args.run_id,
+        "seed": args.seed,
+        "vocab_size": args.vocab_size,
+        "num_layers": args.num_layers,
+        "model_dim": args.model_dim,
+        "num_heads": args.num_heads,
+        "num_kv_heads": args.num_kv_heads,
+        "mlp_mult": args.mlp_mult,
+        "linear_impl": args.linear_impl,
+        "lora_rank": args.lora_rank,
+        "lora_alpha": args.lora_alpha,
+        "lora_fixed_seed": args.lora_fixed_seed,
+        "train_batch_tokens": args.train_batch_tokens,
+        "grad_accum_steps": args.grad_accum_steps,
+        "train_seq_len": args.train_seq_len,
+        "iterations": args.iterations,
+        "val_loss_every": args.val_loss_every,
+    }
 
 
 def main() -> None:
@@ -914,6 +1033,24 @@ def main() -> None:
         with logfile.open("a", encoding="utf-8") as f:
             print(msg, file=f)
 
+    wandb_run = None
+    if args.wandb_enabled:
+        if wandb is None:
+            log("wandb:disabled import_failed", console=True)
+        else:
+            try:
+                wandb_run = wandb.init(
+                    project=args.wandb_project,
+                    entity=args.wandb_entity,
+                    name=args.run_id,
+                    config=wandb_config(args),
+                )
+                log(f"wandb:enabled project:{args.wandb_project} run:{args.run_id}")
+            except Exception as exc:
+                log(f"wandb:disabled init_failed:{exc}")
+    else:
+        log("wandb:disabled by_config")
+
     code = Path(__file__).read_text(encoding="utf-8")
     log(code, console=False)
     log("=" * 100, console=False)
@@ -921,6 +1058,8 @@ def main() -> None:
     log(f"Running MLX {mx.__version__}", console=False)
     log("=" * 100, console=False)
 
+    if args.linear_impl not in LINEAR_IMPL_CHOICES:
+        raise ValueError(f"LINEAR_IMPL must be one of {LINEAR_IMPL_CHOICES}, got {args.linear_impl}")
     if not args.tie_embeddings:
         raise NotImplementedError("train_gpt_mlx.py only supports tied embeddings")
     if not args.tokenizer_path.endswith(".model"):
@@ -957,6 +1096,7 @@ def main() -> None:
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
         mlp_mult=args.mlp_mult,
+        linear_impl=args.linear_impl,
         lora_rank=args.lora_rank,
         lora_alpha=args.lora_alpha,
         lora_fixed_seed=args.lora_fixed_seed,
@@ -986,6 +1126,10 @@ def main() -> None:
     # Print config once so logs are self-describing.
     total_params = sum(int(np.prod(p.shape)) for _, p in tree_flatten(model.parameters()))
     trainable_params = sum(int(np.prod(p.shape)) for _, p in tree_flatten(model.trainable_parameters()))
+    init_full_state = {k: v for k, v in tree_flatten(model.state)}
+    init_serializable_state, init_omitted_state = split_serialized_state(init_full_state)
+    init_quant_bytes, init_quant_raw_bytes, init_quant_stats = estimate_int8_zlib_artifact_bytes(init_serializable_state)
+    omitted_fixed_weight_params = sum(int(arr.size) for arr in init_omitted_state.values())
     log(f"run_id:{args.run_id}")
     log(f"mlx_version:{mx.__version__}")
     log(f"train_loader:shards pattern={args.train_files}")
@@ -1007,11 +1151,26 @@ def main() -> None:
         f"dim:{args.model_dim} heads:{args.num_heads} kv_heads:{args.num_kv_heads} "
         f"seq_len:{args.train_seq_len} tie_embeddings:{args.tie_embeddings}"
     )
+    log(f"trainable_params:{trainable_params}")
     log(
-        f"lora_rank:{args.lora_rank} lora_alpha:{args.lora_alpha} "
-        f"lora_effective_scale:{args.lora_alpha / args.lora_rank:.6f} "
-        f"lora_fixed_seed:{args.lora_fixed_seed}"
+        f"serialized_params:{sum(int(arr.size) for arr in init_serializable_state.values())} "
+        f"omitted_fixed_weight_params:{omitted_fixed_weight_params} "
+        f"omitted_fixed_weight_tensors:{len(init_omitted_state)}"
     )
+    log(
+        f"init_serialized_model_int8_zlib_estimate_in_memory_only:{init_quant_bytes} bytes "
+        f"({init_quant_bytes / (1024.0 * 1024.0):.2f} MiB) "
+        f"(payload:{init_quant_stats['int8_payload_bytes']} bytes "
+        f"{init_quant_stats['int8_payload_bytes'] / (1024.0 * 1024.0):.2f} MiB "
+        f"raw_pickle:{init_quant_raw_bytes} bytes {init_quant_raw_bytes / (1024.0 * 1024.0):.2f} MiB)"
+    )
+    log(f"linear_impl:{args.linear_impl}")
+    if args.linear_impl == "fixed_lora":
+        log(
+            f"lora_rank:{args.lora_rank} lora_alpha:{args.lora_alpha} "
+            f"lora_effective_scale:{args.lora_alpha / args.lora_rank:.6f} "
+            f"lora_fixed_seed:{args.lora_fixed_seed}"
+        )
     log(
         f"iterations:{args.iterations} train_batch_tokens:{args.train_batch_tokens} grad_accum_steps:{args.grad_accum_steps} "
         f"microbatch_tokens:{args.microbatch_tokens} microbatch_batch_size:{args.microbatch_tokens // args.train_seq_len} "
@@ -1027,13 +1186,21 @@ def main() -> None:
     )
     log(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log(f"compute_dtype:{COMPUTE_DTYPE} compile:True")
-    log(
-        f"dtypes tok_emb:{model.tok_emb.weight.dtype} "
-        f"fixed_weight:{model.blocks[0].attn.c_q.fixed_weight.dtype} "
-        f"lora_down:{model.blocks[0].attn.c_q.lora_down.dtype} "
-        f"lora_up:{model.blocks[0].attn.c_q.lora_up.dtype} "
-        f"skip_weights:{model.skip_weights.dtype}"
-    )
+    first_linear = model.blocks[0].attn.c_q
+    if isinstance(first_linear, FixedLoRALinear):
+        log(
+            f"dtypes tok_emb:{model.tok_emb.weight.dtype} "
+            f"fixed_weight:{first_linear.fixed_weight.dtype} "
+            f"lora_down:{first_linear.lora_down.dtype} "
+            f"lora_up:{first_linear.lora_up.dtype} "
+            f"skip_weights:{model.skip_weights.dtype}"
+        )
+    else:
+        log(
+            f"dtypes tok_emb:{model.tok_emb.weight.dtype} "
+            f"linear_weight:{first_linear.weight.dtype} "
+            f"skip_weights:{model.skip_weights.dtype}"
+        )
 
     # ==============================================================================
     # TRAINING LOOP
@@ -1048,7 +1215,7 @@ def main() -> None:
             warmup_loss = mx.array(0.0, dtype=mx.float32)
             grad_scale = 1.0 / args.grad_accum_steps
             for _ in range(args.grad_accum_steps):
-                warmup_loss, grads = loss_and_grad_chunked(args, train_loader, compiled_loss_and_grad)
+                warmup_loss, grads, _ = loss_and_grad_chunked(args, train_loader, compiled_loss_and_grad)
                 accum = accumulate_flat_grads(accum, grads, grad_scale)
             mx.eval(warmup_loss, accum)
             mx.synchronize()
@@ -1083,7 +1250,7 @@ def main() -> None:
         if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
             train_time_ms += 1000.0 * (time.perf_counter() - t0)
             # Validation always scans the same fixed full validation split.
-            val_loss, val_bpb = eval_val(
+            val_loss, val_bpb, val_batch_token_count, val_tail_batch_token_count = eval_val(
                 args,
                 compiled_loss,
                 val_tokens,
@@ -1093,9 +1260,25 @@ def main() -> None:
                 log_fn=log,
             )
             if step % 25 == 0 or last_step:
+                tail_text = (
+                    f" val_tail_batch_tensor_tokens:{val_tail_batch_token_count}"
+                    if val_tail_batch_token_count != val_batch_token_count
+                    else ""
+                )
                 log(
                     f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
+                    f"val_batch_tensor_tokens:{val_batch_token_count}{tail_text} "
                     f"train_time:{train_time_ms:.0f}ms step_avg:{train_time_ms / max(step, 1):.2f}ms"
+                )
+            if wandb_run is not None:
+                wandb_run.log(
+                    {
+                        "val_loss": val_loss,
+                        "val_bpb": val_bpb,
+                        "val_batch_tensor_tokens": val_batch_token_count,
+                        "val_tail_batch_tensor_tokens": val_tail_batch_token_count,
+                    },
+                    step=step,
                 )
             t0 = time.perf_counter()
         if last_step:
@@ -1108,16 +1291,18 @@ def main() -> None:
 
         accum: dict[str, mx.array] | None = None
         train_loss = mx.array(0.0, dtype=mx.float32)
+        train_batch_token_count = 0
         grad_scale = 1.0 / args.grad_accum_steps
         for _ in range(args.grad_accum_steps):
-            loss, grads = loss_and_grad_chunked(args, train_loader, compiled_loss_and_grad)
+            loss, grads, microbatch_token_count = loss_and_grad_chunked(args, train_loader, compiled_loss_and_grad)
             accum = accumulate_flat_grads(accum, grads, grad_scale)
             train_loss = train_loss + loss.astype(mx.float32) * grad_scale
+            train_batch_token_count += microbatch_token_count
             if args.mlx_eager_eval:
                 mx.eval(train_loss, accum)  # materialize each microbatch to cap peak memory
 
         grads = tree_unflatten(list(accum.items()))
-        grads = clip_grad_tree(grads, args.grad_clip_norm)
+        grads, grad_norm_preclip, grad_norm_postclip = clip_grad_tree(grads, args.grad_clip_norm)
         train_loss_value = float(train_loss.item())
         opt.step(model, grads, step=step, lr_mul=lr_mul)
         mx.synchronize()
@@ -1125,12 +1310,33 @@ def main() -> None:
         step_ms = 1000.0 * (time.perf_counter() - step_t0)
         approx_train_time_ms = train_time_ms + 1000.0 * (time.perf_counter() - t0)
         tok_s = args.train_batch_tokens / (step_ms / 1000.0)
+        current_embed_lr = args.tied_embed_lr * lr_mul
+        current_matrix_lr = args.matrix_lr * lr_mul
+        current_scalar_lr = args.scalar_lr * lr_mul
         step += 1
+        if wandb_run is not None:
+            wandb_run.log(
+                {
+                    "train_loss": train_loss_value,
+                    "train_batch_tensor_tokens": train_batch_token_count,
+                    "grad_norm_preclip": grad_norm_preclip,
+                    "grad_norm_postclip": grad_norm_postclip,
+                    "lr_embed": current_embed_lr,
+                    "lr_matrix": current_matrix_lr,
+                    "lr_scalar": current_scalar_lr,
+                    "lr_mul": lr_mul,
+                },
+                step=step,
+            )
         if args.train_log_every > 0 and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None):
             log(
                 f"step:{step}/{args.iterations} train_loss:{train_loss_value:.4f} "
+                f"train_batch_tensor_tokens:{train_batch_token_count} "
+                f"grad_norm:{grad_norm_postclip:.4f} lr_matrix:{current_matrix_lr:.6f} "
                 f"train_time:{approx_train_time_ms:.0f}ms step_avg:{approx_train_time_ms / step:.2f}ms tok_s:{tok_s:.0f}"
             )
+            if step == 10:
+                log("going silent for a bit... I'm still working!")
         if max_wallclock_ms is not None and stop_after_step is None and approx_train_time_ms >= max_wallclock_ms:
             stop_after_step = step
 
@@ -1139,11 +1345,18 @@ def main() -> None:
     # ==============================================================================
     # We always write a raw artifact and a quantized artifact, then validate the
     # quantized roundtrip directly by loading the dequantized tensors back into the
-    # model and running one final validation pass.
+    # model and running one final validation pass. Reconstructible frozen random
+    # weights are omitted from serialization and regenerated from seed at model init.
     out_path = out_dir / f"{args.run_id}_mlx_model.npz"
-    flat_state = {k: v for k, v in tree_flatten(model.state)}
+    full_state = {k: v for k, v in tree_flatten(model.state)}
+    flat_state, omitted_state = split_serialized_state(full_state)
     mx.savez(str(out_path), **flat_state)
     log(f"saved_model:{out_path} bytes:{out_path.stat().st_size}")
+    if omitted_state:
+        log(
+            f"saved_model_excludes_fixed_weights:true omitted_tensors:{len(omitted_state)} "
+            f"omitted_params:{sum(int(arr.size) for arr in omitted_state.values())}"
+        )
 
     quant_obj, quant_stats = quantize_state_dict_int8(flat_state)
     quant_raw = pickle.dumps(quant_obj, protocol=pickle.HIGHEST_PROTOCOL)
@@ -1164,7 +1377,7 @@ def main() -> None:
     quant_flat = dequantize_state_dict_int8(pickle.loads(zlib.decompress(quant_blob_disk)))
     model.update(tree_unflatten(list(quant_flat.items())))
     q_t0 = time.perf_counter()
-    q_val_loss, q_val_bpb = eval_val(
+    q_val_loss, q_val_bpb, _, _ = eval_val(
         args,
         compiled_loss,
         val_tokens,
@@ -1176,6 +1389,8 @@ def main() -> None:
     q_eval_ms = 1000.0 * (time.perf_counter() - q_t0)
     log(f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} eval_time:{q_eval_ms:.0f}ms")
     log(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    if wandb_run is not None:
+        wandb_run.finish()
 
 
 if __name__ == "__main__":

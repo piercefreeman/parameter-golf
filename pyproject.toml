@@ -8,6 +8,7 @@ dependencies = [
     "datasets>=4.8.4",
     "huggingface-hub>=1.8.0",
     "kernels>=0.12.3",
+    "mlx>=0.31.1",
     "numpy>=2.4.4",
     "sentencepiece>=0.2.1",
     "setuptools>=82.0.1",
@@ -15,4 +16,5 @@ dependencies = [
     "torch>=2.10.0",
     "tqdm>=4.67.3",
     "typing-extensions==4.15.0",
+    "wandb>=0.19.11",
 ]

@@ -97,7 +97,7 @@ pip install mlx numpy sentencepiece huggingface-hub datasets tqdm
 Download our cached version of FineWeb with the 1024-token vocabulary:
 
 ```bash
-python3 data/cached_challenge_fineweb.py --variant sp1024 --train-shards 10
+uv run data/cached_challenge_fineweb.py --variant sp1024 --train-shards 10
 ```
 
 This populates `./data/datasets/fineweb10B_sp1024/` and `./data/tokenizers/`.
@@ -111,7 +111,7 @@ ITERATIONS=200 \
 TRAIN_BATCH_TOKENS=8192 \
 VAL_LOSS_EVERY=0 \
 VAL_BATCH_SIZE=8192 \
-python3 train_gpt_mlx.py
+uv run train_gpt_mlx.py
 ```
 
 Validation always runs on the full `fineweb_val_*` split, which is the fixed first-50k-document set. The smoke command above skips periodic validation and just prints the final `val_loss` and `val_bpb` once at the end.
